@@ -1,4 +1,5 @@
 node_modules
 *.blkstat
+.env
 gpu_0_miner_log.txt
 config.txt
