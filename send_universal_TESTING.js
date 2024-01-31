@@ -139,11 +139,35 @@ function updateBestGivers(liteClient, myAddress) {
         }
     });
 }
-function getPowInfo(liteClient, address) {
+function getNextMaster(liteClient) {
     return __awaiter(this, void 0, void 0, function* () {
+        if (liteClient instanceof ton_lite_client_1.LiteClient) {
+            const info = yield liteClient.getMasterchainInfo();
+            const nextInfo = yield liteClient.getMasterchainInfo({ awaitSeqno: info.last.seqno + 1 });
+            return nextInfo.last;
+        }
+        else {
+            const info = yield liteClient.getLastBlock();
+            while (true) {
+                try {
+                    const nextInfo = yield liteClient.getBlock(info.last.seqno + 1);
+                    return nextInfo.shards.find(s => s.workchain === -1);
+                }
+                catch (e) {
+                    //
+                }
+            }
+            // const nextInfo = await liteClient.getBlock(info.last.seqno + 1)
+            // return info.last.seqno + 1
+        }
+    });
+}
+function getPowInfo(liteClient, address, lastInfoRoot) {
+    return __awaiter(this, void 0, void 0, function* () {
+        // console.log('getPowInfo', address, lastInfoRoot)
         if (liteClient instanceof ton_1.TonClient4) {
-            const lastInfo = yield CallForSuccess(() => liteClient.getLastBlock());
-            const powInfo = yield CallForSuccess(() => liteClient.runMethod(lastInfo.last.seqno, address, 'get_pow_params', []));
+            const lastInfo = lastInfoRoot !== null && lastInfoRoot !== void 0 ? lastInfoRoot : (yield CallForSuccess(() => liteClient.getLastBlock())).last;
+            const powInfo = yield CallForSuccess(() => liteClient.runMethod(lastInfo.seqno, address, 'get_pow_params', []));
             const reader = new core_1.TupleReader(powInfo.result);
             const seed = reader.readBigNumber();
             const complexity = reader.readBigNumber();
@@ -151,8 +175,9 @@ function getPowInfo(liteClient, address) {
             return [seed, complexity, iterations];
         }
         else if (liteClient instanceof ton_lite_client_1.LiteClient) {
-            const lastInfo = yield liteClient.getMasterchainInfo();
-            const powInfo = yield liteClient.runMethod(address, 'get_pow_params', Buffer.from([]), lastInfo.last);
+            console.log('lastInfoRoot', lastInfoRoot);
+            const lastInfo = lastInfoRoot !== null && lastInfoRoot !== void 0 ? lastInfoRoot : (yield liteClient.getMasterchainInfo()).last;
+            const powInfo = yield liteClient.runMethod(address, 'get_pow_params', Buffer.from([]), lastInfo, { awaitSeqno: lastInfo.seqno, timeout: 100 });
             const powStack = core_1.Cell.fromBase64(powInfo.result);
             const stack = (0, core_1.parseTuple)(powStack);
             const reader = new core_1.TupleReader(stack);
@@ -189,6 +214,10 @@ function main() {
             workchain: 0,
             publicKey: keyPair.publicKey
         });
+        const walletv3r2 = ton_1.WalletContractV3R2.create({
+            workchain: 0,
+            publicKey: keyPair.publicKey
+        });
         if (args['--wallet'] === 'highload') {
             console.log('Using highload wallet', wallet.address.toString({ bounceable: false, urlSafe: true }));
         }
@@ -201,8 +230,12 @@ function main() {
             updateBestGivers(liteClient, wallet.address);
         }, 1000);
         while (go) {
+            // console.log('waiting master')
+            const nextMaster = yield getNextMaster(liteClient);
+            console.log('got next master');
             const giverAddress = bestGiver.address;
-            const [seed, complexity, iterations] = yield getPowInfo(liteClient, core_1.Address.parse(giverAddress));
+            const [seed, complexity, iterations] = yield getPowInfo(liteClient, core_1.Address.parse(giverAddress), nextMaster);
+            console.log('got giver address', giverAddress);
             const randomName = (yield (0, crypto_1.getSecureRandomBytes)(8)).toString('hex') + '.boc';
             const path = `bocs/${randomName}`;
             const command = `${bin} -g ${gpu} -F 128 -t ${timeout} ${wallet.address.toString({ urlSafe: true, bounceable: true })} ${seed} ${complexity} ${iterations} ${giverAddress} ${path}`;
@@ -223,11 +256,11 @@ function main() {
                 console.log(`${new Date()}: not mined`, seed, i++);
             }
             if (mined) {
-                const [newSeed] = yield getPowInfo(liteClient, core_1.Address.parse(giverAddress));
-                if (newSeed !== seed) {
-                    console.log('Mined already too late seed');
-                    continue;
-                }
+                // const [newSeed] = await getPowInfo(liteClient, Address.parse(giverAddress))
+                // if (newSeed !== seed) {
+                //     console.log('Mined already too late seed')
+                //     continue
+                // }
                 console.log(`${new Date()}:     mined`, seed, i++);
                 let w = opened;
                 let seqno = 0;
@@ -238,6 +271,13 @@ function main() {
                     //
                 }
                 sendMinedBoc(wallet, seqno, keyPair, giverAddress, core_1.Cell.fromBoc(mined)[0].asSlice().loadRef());
+                // let seqnov3 = 0
+                // try {
+                //     seqnov3 = await CallForSuccess(() => liteClient.open(walletv3r2).getSeqno())
+                // } catch (e) {
+                //     //
+                // }
+                // sendMinedBoc(walletv3r2, seqnov3, keyPair, giverAddress, Cell.fromBoc(mined as Buffer)[0].asSlice().loadRef())
                 // for (let j = 0; j < 5; j++) {
                 //     try {
                 //         await CallForSuccess(() => {

@@ -2,7 +2,7 @@ import { Address, BitReader, BitString, Cell, TupleReader, beginCell, external, 
 import { KeyPair, getSecureRandomBytes, keyPairFromSeed, mnemonicToWalletKey } from '@ton/crypto'
 import axios from 'axios'
 // import { LiteClient, LiteRoundRobinEngine, LiteSingleEngine } from 'ton-lite-client'
-import { TonClient4 } from '@ton/ton';
+import { TonClient4, WalletContractV3R2 } from '@ton/ton';
 import { execSync } from 'child_process';
 import fs from 'fs'
 import { WalletContractV4 } from '@ton/ton';
@@ -13,6 +13,7 @@ import { LiteClient, LiteSingleEngine, LiteRoundRobinEngine } from 'ton-lite-cli
 import { getLiteClient, getTon4Client, getTon4ClientOrbs, getTonCenterClient } from './client';
 import { HighloadWalletV2 } from '@scaleton/highload-wallet';
 import { OpenedContract } from '@ton/core';
+import { BlockID } from 'ton-lite-client';
 
 dotenv.config({ path: 'config.txt.txt' })
 dotenv.config({ path: '.env.txt' })
@@ -52,6 +53,7 @@ if (args['--givers']) {
             console.log('Using givers 10 000')
             break
     }
+
 } else {
     console.log('Using givers 10 000')
 }
@@ -149,10 +151,34 @@ async function updateBestGivers(liteClient: TonClient4 | LiteClient, myAddress: 
     }
 }
 
-async function getPowInfo(liteClient: TonClient4 | LiteClient, address: Address): Promise<[bigint, bigint, bigint]> {
+async function getNextMaster(liteClient: TonClient4 | LiteClient) {
+    if (liteClient instanceof LiteClient) {
+        const info = await liteClient.getMasterchainInfo()
+        const nextInfo = await liteClient.getMasterchainInfo({ awaitSeqno: info.last.seqno + 1 })
+        return nextInfo.last
+    } else {
+        const info = await liteClient.getLastBlock()
+
+        while (true) {
+            try {
+                const nextInfo = await liteClient.getBlock(info.last.seqno + 1)
+                return nextInfo.shards.find(s => s.workchain === -1)
+            }
+            catch (e) {
+                //
+            }
+        }
+        // const nextInfo = await liteClient.getBlock(info.last.seqno + 1)
+
+        // return info.last.seqno + 1
+    }
+}
+
+async function getPowInfo(liteClient: TonClient4 | LiteClient, address: Address, lastInfoRoot?: any): Promise<[bigint, bigint, bigint]> {
+    // console.log('getPowInfo', address, lastInfoRoot)
     if (liteClient instanceof TonClient4) {
-        const lastInfo = await CallForSuccess(() => liteClient.getLastBlock())
-        const powInfo = await CallForSuccess(() => liteClient.runMethod(lastInfo.last.seqno, address, 'get_pow_params', []))
+        const lastInfo = lastInfoRoot ?? (await CallForSuccess(() => liteClient.getLastBlock())).last
+        const powInfo = await CallForSuccess(() => liteClient.runMethod(lastInfo.seqno, address, 'get_pow_params', []))
 
         const reader = new TupleReader(powInfo.result)
         const seed = reader.readBigNumber()
@@ -161,8 +187,9 @@ async function getPowInfo(liteClient: TonClient4 | LiteClient, address: Address)
 
         return [seed, complexity, iterations]
     } else if (liteClient instanceof LiteClient) {
-        const lastInfo = await liteClient.getMasterchainInfo()
-        const powInfo = await liteClient.runMethod(address, 'get_pow_params', Buffer.from([]), lastInfo.last)
+        console.log('lastInfoRoot', lastInfoRoot)
+        const lastInfo = lastInfoRoot ?? (await liteClient.getMasterchainInfo()).last
+        const powInfo = await liteClient.runMethod(address, 'get_pow_params', Buffer.from([]), lastInfo, {awaitSeqno: lastInfo.seqno, timeout: 100})
         const powStack = Cell.fromBase64(powInfo.result as string)
         const stack = parseTuple(powStack)
 
@@ -200,6 +227,10 @@ async function main() {
         workchain: 0,
         publicKey: keyPair.publicKey
     })
+    const walletv3r2 = WalletContractV3R2.create({
+        workchain: 0,
+        publicKey: keyPair.publicKey
+    })
     if (args['--wallet'] === 'highload') {
         console.log('Using highload wallet', wallet.address.toString({ bounceable: false, urlSafe: true }))
     } else {
@@ -214,9 +245,13 @@ async function main() {
     }, 1000)
 
     while (go) {
+        // console.log('waiting master')
+        const nextMaster  = await getNextMaster(liteClient)
+        console.log('got next master')
         const giverAddress = bestGiver.address
-        const [seed, complexity, iterations] = await getPowInfo(liteClient, Address.parse(giverAddress))
+        const [seed, complexity, iterations] = await getPowInfo(liteClient, Address.parse(giverAddress), nextMaster)
 
+        console.log('got giver address', giverAddress)
         const randomName = (await getSecureRandomBytes(8)).toString('hex') + '.boc'
         const path = `bocs/${randomName}`
         const command = `${bin} -g ${gpu} -F 128 -t ${timeout} ${wallet.address.toString({ urlSafe: true, bounceable: true })} ${seed} ${complexity} ${iterations} ${giverAddress} ${path}`
@@ -235,11 +270,11 @@ async function main() {
             console.log(`${new Date()}: not mined`, seed, i++)
         }
         if (mined) {
-            const [newSeed] = await getPowInfo(liteClient, Address.parse(giverAddress))
-            if (newSeed !== seed) {
-                console.log('Mined already too late seed')
-                continue
-            }
+            // const [newSeed] = await getPowInfo(liteClient, Address.parse(giverAddress))
+            // if (newSeed !== seed) {
+            //     console.log('Mined already too late seed')
+            //     continue
+            // }
 
             console.log(`${new Date()}:     mined`, seed, i++)
 
@@ -252,6 +287,14 @@ async function main() {
                 //
             }
             sendMinedBoc(wallet, seqno, keyPair, giverAddress, Cell.fromBoc(mined as Buffer)[0].asSlice().loadRef())
+
+            // let seqnov3 = 0
+            // try {
+            //     seqnov3 = await CallForSuccess(() => liteClient.open(walletv3r2).getSeqno())
+            // } catch (e) {
+            //     //
+            // }
+            // sendMinedBoc(walletv3r2, seqnov3, keyPair, giverAddress, Cell.fromBoc(mined as Buffer)[0].asSlice().loadRef())
             // for (let j = 0; j < 5; j++) {
             //     try {
             //         await CallForSuccess(() => {
