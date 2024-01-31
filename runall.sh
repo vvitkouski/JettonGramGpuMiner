@@ -1,4 +1,5 @@
 #!/bin/bash
+npm install
 
 i=0
 
