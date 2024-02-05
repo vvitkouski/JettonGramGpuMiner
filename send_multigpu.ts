@@ -3,7 +3,7 @@ import { KeyPair, getSecureRandomBytes, keyPairFromSeed, mnemonicToWalletKey } f
 import axios from 'axios'
 // import { LiteClient, LiteRoundRobinEngine, LiteSingleEngine } from 'ton-lite-client'
 import { TonClient4 } from '@ton/ton';
-import { execSync } from 'child_process';
+import { execSync, exec as exec_callback, spawn, ChildProcess } from 'child_process';
 import fs from 'fs'
 import { WalletContractV4 } from '@ton/ton';
 import dotenv from 'dotenv'
@@ -14,6 +14,9 @@ import { getLiteClient, getTon4Client, getTon4ClientOrbs, getTonCenterClient, ge
 import { HighloadWalletV2 } from '@scaleton/highload-wallet';
 import { OpenedContract } from '@ton/core';
 import { Api } from 'tonapi-sdk-js';
+import { promisify } from 'util'
+
+const exec = promisify(exec_callback)
 
 dotenv.config({ path: 'config.txt.txt' })
 dotenv.config({ path: '.env.txt' })
@@ -26,7 +29,7 @@ const args = arg({
     '--givers': Number, // 100 1000 10000
     '--api': String, // lite, tonhub, tonapi
     '--bin': String, // cuda, opencl or path to miner
-    '--gpu': Number, // gpu id, default 0
+    '--gpu-count': Number, // GPU COUNT!!!
     '--timeout': Number, // Timeout for mining in seconds
     '--allow-shards': Boolean, // if true - allows mining to other shards
     '-c': String,  // blockchain config
@@ -68,12 +71,12 @@ if (args['--bin']) {
 }
 console.log('Using bin', bin)
 
-const gpu = args['--gpu'] ?? 0
+const gpus = args['--gpu-count'] ?? 1
 const timeout = args['--timeout'] ?? 5
 
 const allowShards = args['--allow-shards'] ?? false
 
-console.log('Using GPU', gpu)
+console.log('Using GPUs count', gpus)
 console.log('Using timeout', timeout)
 
 const mySeed = process.env.SEED as string
@@ -151,7 +154,7 @@ let lastMinedSeed: bigint = BigInt(0)
 let start = Date.now()
 
 async function main() {
-    const minerOk = await testMiner()
+    const minerOk = await testMiner(gpus)
     if (!minerOk) {
         console.log('Your miner is not working')
         console.log('Check if you use correct bin (cuda, amd).')
@@ -213,24 +216,63 @@ async function main() {
             continue
         }
 
-        const randomName = (await getSecureRandomBytes(8)).toString('hex') + '.boc'
-        const path = `bocs/${randomName}`
-        const command = `${bin} -g ${gpu} -F 128 -t ${timeout} ${targetAddress} ${seed} ${complexity} ${iterations} ${giverAddress} ${path}`
-        try {
-            const output = execSync(command, { encoding: 'utf-8', stdio: "pipe" });  // the default is 'buffer'
-        } catch (e) {
-        }
-        let mined: Buffer | undefined = undefined
-        try {
-            mined = fs.readFileSync(path)
-            lastMinedSeed = seed
-            fs.rmSync(path)
-        } catch (e) {
-            //
-        }
+        const promises: any[] = []
+
+        let handlers: ChildProcess[] = []
+
+        const mined: Buffer | undefined = await new Promise(async (resolve, reject) => {
+            let rest = gpus
+            for (let i = 0; i < gpus; i++) {
+                const randomName = (await getSecureRandomBytes(8)).toString('hex') + '.boc'
+                const path = `bocs/${randomName}`
+                const command = `-g ${i} -F 128 -t ${timeout} ${targetAddress} ${seed} ${complexity} ${iterations} ${giverAddress} ${path}`
+
+                const procid = spawn(bin, command.split(' '), { stdio: "pipe" });
+
+
+
+                // procid.on('message', (m) => {
+                //     console.log('message', m)
+                // })
+
+                // procid.stdout.on('data', (data) => {
+                //     console.log(`stdout: ${data}`);
+                // })
+                // procid.stderr.on('data', (data) => {
+                //     console.log(`err: ${data}`);
+                // })
+                handlers.push(procid)
+
+                procid.on('exit', () => {
+                    let mined: Buffer | undefined = undefined
+                    try {
+                        const exists = fs.existsSync(path)
+                        if (exists) {
+                            mined = fs.readFileSync(path)
+                            resolve(mined)
+                            lastMinedSeed = seed
+                            fs.rmSync(path)
+                            for (const handle of handlers) {
+                                handle.kill('SIGINT')
+                            }
+                        }
+                    } catch (e) {
+                        //
+                        console.log('not mined', e)
+                    } finally {
+                        if (--rest === 0) {
+                            resolve(undefined)
+                        }
+                    }
+                })
+            }
+        })
+
+
         if (!mined) {
             console.log(`${formatTime()}: not mined`, seed.toString(16).slice(0, 4), i++, success, Math.floor((Date.now() - start) / 1000))
         }
+
         if (mined) {
             const [newSeed] = await getPowInfo(liteClient, Address.parse(giverAddress))
             if (newSeed !== seed) {
@@ -258,7 +300,7 @@ async function main() {
                     seqno = Number(BigInt(res.stack[0].num as string))
                 }
             }
-            await sendMinedBoc(wallet, seqno, keyPair, giverAddress, Cell.fromBoc(mined as Buffer)[0].asSlice().loadRef())
+            await sendMinedBoc(wallet, seqno, keyPair, giverAddress, Cell.fromBoc(mined)[0].asSlice().loadRef())
         }
     }
 }
@@ -350,23 +392,26 @@ async function sendMinedBoc(
     }
 }
 
-async function testMiner(): Promise<boolean> {
-    const randomName = (await getSecureRandomBytes(8)).toString('hex') + '.boc'
-    const path = `bocs/${randomName}`
-    const command = `${bin} -g ${gpu} -F 128 -t ${timeout} kQBWkNKqzCAwA9vjMwRmg7aY75Rf8lByPA9zKXoqGkHi8SM7 229760179690128740373110445116482216837 53919893334301279589334030174039261347274288845081144962207220498400000000000 10000000000 kQBWkNKqzCAwA9vjMwRmg7aY75Rf8lByPA9zKXoqGkHi8SM7 ${path}`
-    try {
-        const output = execSync(command, { encoding: 'utf-8', stdio: "pipe" });  // the default is 'buffer'
-    } catch (e) {
-    }
-    let mined: Buffer | undefined = undefined
-    try {
-        mined = fs.readFileSync(path)
-        fs.rmSync(path)
-    } catch (e) {
-        //
-    }
-    if (!mined) {
-        return false
+async function testMiner(gpus: number): Promise<boolean> {
+    for (let i = 0; i < gpus; i++) {
+        const gpu = i
+        const randomName = (await getSecureRandomBytes(8)).toString('hex') + '.boc'
+        const path = `bocs/${randomName}`
+        const command = `${bin} -g ${gpu} -F 128 -t ${timeout} kQBWkNKqzCAwA9vjMwRmg7aY75Rf8lByPA9zKXoqGkHi8SM7 229760179690128740373110445116482216837 53919893334301279589334030174039261347274288845081144962207220498400000000000 10000000000 kQBWkNKqzCAwA9vjMwRmg7aY75Rf8lByPA9zKXoqGkHi8SM7 ${path}`
+        try {
+            const output = execSync(command, { encoding: 'utf-8', stdio: "pipe" });  // the default is 'buffer'
+        } catch (e) {
+        }
+        let mined: Buffer | undefined = undefined
+        try {
+            mined = fs.readFileSync(path)
+            fs.rmSync(path)
+        } catch (e) {
+            //
+        }
+        if (!mined) {
+            return false
+        }
     }
 
     return true
@@ -408,6 +453,7 @@ export function delay(ms: number) {
         setTimeout(resolve, ms)
     })
 }
+
 
 function formatTime() {
     return new Date().toLocaleTimeString('en-US', {
